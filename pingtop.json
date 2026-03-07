@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "check_interval_seconds": 0.5,
+  "ping_timeout_ms": 1200,
+  "ui_refresh_interval_seconds": 0.5,
+  "stats_window_seconds": 7200,
+  "latency_warning_ms": 100,
+  "latency_critical_ms": 250,
+  "logging_mode": "failures_only",
+  "around_failure_before_seconds": 10,
+  "around_failure_after_seconds": 10,
+  "log_rotation_max_mb": 25,
+  "log_rotation_keep_files": 10,
+  "event_history_size": 40,
+  "visible_event_lines": 8,
+  "targets": [
+    {
+      "value": "1.1.1.1",
+      "type": "ip"
+    },
+    {
+      "value": "8.8.8.8",
+      "type": "ip"
+    },
+    {
+      "value": "google.com",
+      "type": "hostname"
+    },
+    {
+      "value": "cloudflare.com",
+      "type": "hostname"
+    },
+    {
+      "value": "apple.com",
+      "type": "hostname"
+    }
+  ]
+}
