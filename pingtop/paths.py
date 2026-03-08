@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,12 +41,10 @@ def _resolve_launch_path(argv0: Optional[str] = None, cwd: Optional[Path] = None
     base_dir = Path.cwd() if cwd is None else Path(cwd)
     if not raw or raw in {"-", "-c", "-m"}:
         return base_dir
-    candidate = Path(raw)
+    candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
-        candidate = (base_dir / candidate).resolve()
-    else:
-        candidate = candidate.resolve()
-    return candidate
+        candidate = base_dir / candidate
+    return Path(os.path.abspath(str(candidate)))
 
 
 def _resolve_runtime_dir(launch_path: Path) -> Path:

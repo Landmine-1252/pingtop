@@ -12,8 +12,14 @@ if TYPE_CHECKING:
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.IGNORECASE)
 
 
+def _local_datetime(timestamp: Optional[float] = None) -> dt.datetime:
+    seconds = time.time() if timestamp is None else float(timestamp)
+    # Convert through UTC first so small epoch-adjacent timestamps work on Windows too.
+    return dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc).astimezone()
+
+
 def now_local_iso(timestamp: Optional[float] = None, *, milliseconds: bool = False) -> str:
-    value = dt.datetime.fromtimestamp(timestamp or time.time()).astimezone()
+    value = _local_datetime(timestamp)
     timespec = "milliseconds" if milliseconds else "seconds"
     return value.isoformat(timespec=timespec)
 
@@ -99,7 +105,7 @@ def format_latency(latency_ms: Optional[float]) -> str:
 
 
 def format_timestamp_short(timestamp: float) -> str:
-    return dt.datetime.fromtimestamp(timestamp).astimezone().strftime("%H:%M:%S")
+    return _local_datetime(timestamp).strftime("%H:%M:%S")
 
 
 def shorten(text: str, width: int) -> str:

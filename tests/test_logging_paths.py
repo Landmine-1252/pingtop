@@ -46,6 +46,12 @@ class RuntimePathTests(unittest.TestCase):
             self.assertEqual(module_paths.runtime_dir, root)
             self.assertEqual(pyz_paths.runtime_dir, root / "dist")
 
+    def test_now_local_iso_handles_small_epoch_timestamps(self) -> None:
+        from pingtop.util import now_local_iso
+
+        value = now_local_iso(100.0, milliseconds=True)
+        self.assertIn("T", value)
+
 
 class CSVLoggerTests(unittest.TestCase):
     def test_around_failure_logging_captures_before_and_after(self) -> None:
