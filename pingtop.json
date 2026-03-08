@@ -4,6 +4,8 @@
   "ping_timeout_ms": 1200,
   "ui_refresh_interval_seconds": 0.5,
   "stats_window_seconds": 7200,
+  "diagnosis_confirm_cycles": 2,
+  "recovery_confirm_cycles": 2,
   "latency_warning_ms": 100,
   "latency_critical_ms": 250,
   "logging_mode": "failures_only",

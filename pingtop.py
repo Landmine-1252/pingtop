@@ -199,6 +199,8 @@ class AppConfig:
     ping_timeout_ms: int = 1200
     ui_refresh_interval_seconds: float = 0.5
     stats_window_seconds: int = 3600
+    diagnosis_confirm_cycles: int = 2
+    recovery_confirm_cycles: int = 2
     latency_warning_ms: int = 100
     latency_critical_ms: int = 250
     logging_mode: str = "around_failure"
@@ -236,6 +238,12 @@ class AppConfig:
                 data.get("ui_refresh_interval_seconds", base.ui_refresh_interval_seconds)
             ),
             stats_window_seconds=int(data.get("stats_window_seconds", base.stats_window_seconds)),
+            diagnosis_confirm_cycles=int(
+                data.get("diagnosis_confirm_cycles", base.diagnosis_confirm_cycles)
+            ),
+            recovery_confirm_cycles=int(
+                data.get("recovery_confirm_cycles", base.recovery_confirm_cycles)
+            ),
             latency_warning_ms=int(data.get("latency_warning_ms", base.latency_warning_ms)),
             latency_critical_ms=int(data.get("latency_critical_ms", base.latency_critical_ms)),
             logging_mode=str(data.get("logging_mode", base.logging_mode)),
@@ -263,6 +271,8 @@ class AppConfig:
             2,
         )
         self.stats_window_seconds = int(clamp(float(self.stats_window_seconds), 30.0, 2_592_000.0))
+        self.diagnosis_confirm_cycles = int(clamp(float(self.diagnosis_confirm_cycles), 1.0, 10.0))
+        self.recovery_confirm_cycles = int(clamp(float(self.recovery_confirm_cycles), 1.0, 10.0))
         self.latency_warning_ms = int(clamp(float(self.latency_warning_ms), 10.0, 10000.0))
         self.latency_critical_ms = int(clamp(float(self.latency_critical_ms), 10.0, 10000.0))
         if self.latency_critical_ms < self.latency_warning_ms:
@@ -301,6 +311,8 @@ class AppConfig:
             "ping_timeout_ms": self.ping_timeout_ms,
             "ui_refresh_interval_seconds": self.ui_refresh_interval_seconds,
             "stats_window_seconds": self.stats_window_seconds,
+            "diagnosis_confirm_cycles": self.diagnosis_confirm_cycles,
+            "recovery_confirm_cycles": self.recovery_confirm_cycles,
             "latency_warning_ms": self.latency_warning_ms,
             "latency_critical_ms": self.latency_critical_ms,
             "logging_mode": self.logging_mode,
@@ -401,6 +413,13 @@ class EventEntry:
     timestamp: float
     level: str
     message: str
+
+
+@dataclass(frozen=True)
+class DiagnosisAssessment:
+    key: str
+    confirmed_message: str
+    suspected_message: str
 
 
 @dataclass
@@ -505,6 +524,8 @@ class TargetStats:
     dns_failure_count: int = 0
     ping_failure_count: int = 0
     consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    recovery_pending: bool = False
     last_state: str = "unknown"
     last_result: str = "pending"
     last_latency_ms: Optional[float] = None
@@ -528,12 +549,15 @@ class TargetStats:
             self.failure_count += 1
             self.dns_failure_count += 1
             self.consecutive_failures += 1
+            self.consecutive_successes = 0
+            self.recovery_pending = True
             self.last_state = "down"
             self.last_result = "DNS_FAIL"
             self.last_latency_ms = None
         elif result.ping_success:
             self.success_count += 1
             self.consecutive_failures = 0
+            self.consecutive_successes += 1
             self.last_state = "up"
             self.last_result = "UP"
             self.last_latency_ms = result.latency_ms
@@ -541,6 +565,8 @@ class TargetStats:
             self.failure_count += 1
             self.ping_failure_count += 1
             self.consecutive_failures += 1
+            self.consecutive_successes = 0
+            self.recovery_pending = True
             self.last_state = "down"
             self.last_result = "PING_FAIL"
             self.last_latency_ms = None
@@ -559,6 +585,8 @@ class TargetStats:
         self.dns_failure_count = 0
         self.ping_failure_count = 0
         self.consecutive_failures = 0
+        self.consecutive_successes = 0
+        self.recovery_pending = False
 
 
 @dataclass
@@ -611,10 +639,12 @@ class StateStore:
         self.session_window = RollingWindowCounter(config.stats_window_seconds)
         self.stats_window_seconds = config.stats_window_seconds
         self.diagnosis = "Waiting for first cycle"
+        self.confirmed_diagnosis_key = "waiting"
+        self.pending_diagnosis_key = "waiting"
+        self.pending_diagnosis_streak = 0
         self.last_cycle_completed_at = 0.0
         self.last_cycle_id = 0
         self.sync_targets(config)
-        self.add_event("info", "Session started")
 
     def sync_targets(self, config: AppConfig) -> bool:
         with self.lock:
@@ -686,12 +716,17 @@ class StateStore:
                 elif not result.ping_success:
                     self.session.ping_failures += 1
 
-                if result.ping_success and previous_state == "down":
+                if (
+                    result.ping_success
+                    and stats.recovery_pending
+                    and stats.consecutive_successes >= config.recovery_confirm_cycles
+                ):
                     self.add_event(
                         "info",
                         f"{result.target} recovered ({format_latency(result.latency_ms)})",
                         timestamp=result.timestamp,
                     )
+                    stats.recovery_pending = False
                 elif result.is_failure:
                     should_report = (
                         previous_state != "down"
@@ -706,10 +741,10 @@ class StateStore:
                             timestamp=result.timestamp,
                         )
 
-            diagnosis = diagnose_cycle(results, config)
-            if diagnosis != self.diagnosis:
-                self.add_event("info", f"Diagnosis changed: {diagnosis}", timestamp=self.last_cycle_completed_at)
-            self.diagnosis = diagnosis
+            assessment = diagnose_cycle(results, config)
+            confirmed_changed = self._update_diagnosis(assessment, config)
+            if confirmed_changed:
+                self.add_event("info", f"Diagnosis changed: {self.diagnosis}", timestamp=self.last_cycle_completed_at)
 
     def reset_counters(self) -> None:
         with self.lock:
@@ -745,16 +780,58 @@ class StateStore:
                 last_cycle_id=self.last_cycle_id,
             )
 
+    def _update_diagnosis(self, assessment: DiagnosisAssessment, config: AppConfig) -> bool:
+        if assessment.key == self.pending_diagnosis_key:
+            self.pending_diagnosis_streak += 1
+        else:
+            self.pending_diagnosis_key = assessment.key
+            self.pending_diagnosis_streak = 1
 
-def diagnose_cycle(results: list[CheckResult], config: AppConfig) -> str:
+        required_cycles = self._required_diagnosis_cycles(assessment.key, config)
+        if assessment.key == self.confirmed_diagnosis_key:
+            self.diagnosis = assessment.confirmed_message
+            return False
+
+        if self.pending_diagnosis_streak >= required_cycles:
+            self.confirmed_diagnosis_key = assessment.key
+            self.diagnosis = assessment.confirmed_message
+            return True
+
+        if assessment.key == "healthy":
+            self.diagnosis = (
+                "Recovery observed, confirming stability "
+                f"({self.pending_diagnosis_streak}/{required_cycles})"
+            )
+        else:
+            self.diagnosis = (
+                f"Suspected {assessment.suspected_message} "
+                f"({self.pending_diagnosis_streak}/{required_cycles})"
+            )
+        return False
+
+    def _required_diagnosis_cycles(self, assessment_key: str, config: AppConfig) -> int:
+        if assessment_key in ("waiting", "no_targets"):
+            return 1
+        if assessment_key == "healthy":
+            if self.confirmed_diagnosis_key in ("waiting", "no_targets", "healthy"):
+                return 1
+            return config.recovery_confirm_cycles
+        return config.diagnosis_confirm_cycles
+
+
+def diagnose_cycle(results: list[CheckResult], config: AppConfig) -> DiagnosisAssessment:
     if not config.targets:
-        return "No targets configured"
+        return DiagnosisAssessment("no_targets", "No targets configured", "no targets configured")
     if not results:
-        return "Waiting for first cycle"
+        return DiagnosisAssessment("waiting", "Waiting for first cycle", "waiting for first cycle")
 
     failures = [result for result in results if result.is_failure]
     if not failures:
-        return "All monitored targets are reachable"
+        return DiagnosisAssessment(
+            "healthy",
+            "All monitored targets are reachable",
+            "all monitored targets are reachable",
+        )
 
     ip_results = [result for result in results if result.target_type == "ip"]
     host_results = [result for result in results if result.target_type == "hostname"]
@@ -767,23 +844,49 @@ def diagnose_cycle(results: list[CheckResult], config: AppConfig) -> str:
         if result.dns_success is True and not result.ping_success
     )
 
-    if ip_results:
-        network_threshold = max(1, math.ceil(len(ip_results) * 0.75))
+    if len(ip_results) >= 2:
+        network_threshold = max(2, math.ceil(len(ip_results) * 0.75))
         if ip_failures >= network_threshold:
-            return "Likely general network issue"
+            return DiagnosisAssessment(
+                "network_issue",
+                "Likely general network issue",
+                "general network issue",
+            )
 
-    if host_results:
-        dns_threshold = max(1, math.ceil(len(host_results) * 0.75))
+    if len(host_results) >= 2:
+        dns_threshold = max(2, math.ceil(len(host_results) * 0.75))
         if ip_successes > 0 and host_dns_failures >= dns_threshold:
-            return "Likely DNS issue"
+            return DiagnosisAssessment(
+                "dns_issue",
+                "Likely DNS issue",
+                "DNS issue",
+            )
     if len(failures) == 1 and len(results) > 1:
-        return "Likely isolated target or path issue"
-    if host_results:
+        return DiagnosisAssessment(
+            "isolated_issue",
+            "Likely isolated target or path issue",
+            "isolated target or path issue",
+        )
+    if len(host_results) >= 2:
+        reachability_threshold = max(2, math.ceil(len(host_results) * 0.75))
         if host_reachability_failures > 0 and host_dns_failures == 0:
-            if host_reachability_failures == len(host_results) and ip_successes > 0:
-                return "DNS okay, but resolved hosts are not reachable"
-            return "DNS okay, reachability failed for one or more host targets"
-    return "Mixed failures across monitored targets"
+            if host_reachability_failures >= reachability_threshold and ip_successes > 0:
+                if host_reachability_failures == len(host_results):
+                    return DiagnosisAssessment(
+                        "host_reachability_all",
+                        "DNS okay, but resolved hosts are not reachable",
+                        "resolved hosts are not reachable even though DNS is working",
+                    )
+                return DiagnosisAssessment(
+                    "host_reachability_some",
+                    "DNS okay, reachability failed for multiple host targets",
+                    "host reachability issue after successful DNS resolution",
+                )
+    return DiagnosisAssessment(
+        "mixed_failures",
+        "Mixed failures across monitored targets",
+        "mixed failures across monitored targets",
+    )
 
 
 class PingRunner:
@@ -1236,6 +1339,7 @@ class Renderer:
 
     def __init__(self) -> None:
         self.ansi = sys.stdout.isatty()
+        self.last_rendered_line_count = 0
         if os.name == "nt" and self.ansi:
             self.ansi = self._enable_windows_ansi()
 
@@ -1250,11 +1354,22 @@ class Renderer:
             sys.stdout.flush()
 
     def draw(self, text: str) -> None:
-        if self.ansi:
-            sys.stdout.write("\x1b[H\x1b[2J")
-        sys.stdout.write(text)
-        if not text.endswith("\n"):
-            sys.stdout.write("\n")
+        if not self.ansi:
+            sys.stdout.write(text)
+            if not text.endswith("\n"):
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+            return
+
+        lines = text.splitlines()
+        for index, line in enumerate(lines, start=1):
+            sys.stdout.write(f"\x1b[{index};1H\x1b[2K{line}")
+
+        for index in range(len(lines) + 1, self.last_rendered_line_count + 1):
+            sys.stdout.write(f"\x1b[{index};1H\x1b[2K")
+
+        sys.stdout.write(f"\x1b[{len(lines) + 1};1H\x1b[J")
+        self.last_rendered_line_count = len(lines)
         sys.stdout.flush()
 
     def build_screen(
@@ -1277,92 +1392,193 @@ class Renderer:
             if config.log_rotation_max_mb > 0
             else "off"
         )
+        visible_events = self._interesting_events(snapshot.recent_events)
+        shown_event_count = min(len(visible_events), config.visible_event_lines)
         diagnosis_lower = snapshot.diagnosis.lower()
         if paused or "waiting" in diagnosis_lower or "no targets" in diagnosis_lower:
+            status_color = "yellow"
+        elif "suspected" in diagnosis_lower or "confirming" in diagnosis_lower or "recovery observed" in diagnosis_lower:
             status_color = "yellow"
         elif "reachable" in diagnosis_lower:
             status_color = "green"
         else:
             status_color = "red"
-        title = f"pingtop | status {status} | diagnosis {snapshot.diagnosis}"
-        header_lines = [
-            self.style(shorten(title, width), bold=True, fg=status_color),
-            shorten(
-                (
-                    f"checks {format_duration(config.check_interval_seconds)} | "
-                    f"ping timeout {config.ping_timeout_ms}ms | "
-                    f"ui refresh {format_duration(config.ui_refresh_interval_seconds)} | "
-                    f"stats {window_label} | "
-                    f"latency warn/crit {config.latency_warning_ms}/{config.latency_critical_ms}ms | "
-                    f"logging {config.logging_mode} | "
-                    f"rotate {rotation_label} | "
-                    f"targets {len(config.targets)}"
-                ),
+        header_lines = [self.style("pingtop", bold=True, fg="green")]
+        header_lines.append(self._diagnosis_banner(snapshot.diagnosis, width, status_color))
+        header_lines.extend(
+            self._wrap_pairs(
+                "Status",
+                [
+                    self._kv_pair("mode", status, value_color=status_color),
+                    self._kv_pair("events", f"{shown_event_count}/{len(visible_events)}"),
+                    self._kv_pair(
+                        "last",
+                        format_timestamp_short(snapshot.last_cycle_completed_at)
+                        if snapshot.last_cycle_completed_at
+                        else "-",
+                    ),
+                ],
                 width,
-            ),
-            shorten(
-                (
-                    f"rolling {window_label}: checks {abbreviate_count(snapshot.session_window.checks)} | "
-                    f"ok {abbreviate_count(snapshot.session_window.successes)} | "
-                    f"fail {abbreviate_count(snapshot.session_window.failures)} | "
-                    f"dns {abbreviate_count(snapshot.session_window.dns_failures)} | "
-                    f"ping {abbreviate_count(snapshot.session_window.ping_failures)} | "
-                    f"events {min(len(snapshot.recent_events), config.visible_event_lines)}/{len(snapshot.recent_events)} shown | "
-                    f"last cycle {format_timestamp_short(snapshot.last_cycle_completed_at) if snapshot.last_cycle_completed_at else '-'}"
-                ),
+                label_color=status_color,
+            )
+        )
+        header_lines.extend(
+            self._wrap_pairs(
+                "Timing",
+                [
+                    self._kv_pair("check", format_duration(config.check_interval_seconds)),
+                    self._kv_pair("timeout", f"{config.ping_timeout_ms}ms"),
+                    self._kv_pair("refresh", format_duration(config.ui_refresh_interval_seconds)),
+                    self._kv_pair("targets", str(len(config.targets))),
+                ],
                 width,
-            ),
-            shorten(
-                (
-                    f"all-time: cycles {abbreviate_count(snapshot.session.cycles_completed)} | "
-                    f"checks {abbreviate_count(snapshot.session.total_checks)} | "
-                    f"ok {abbreviate_count(snapshot.session.successes)} | "
-                    f"fail {abbreviate_count(snapshot.session.failures)} | "
-                    f"dns {abbreviate_count(snapshot.session.dns_failures)} | "
-                    f"ping {abbreviate_count(snapshot.session.ping_failures)}"
-                ),
+            )
+        )
+        header_lines.extend(
+            self._wrap_pairs(
+                "Config",
+                [
+                    self._kv_pair("stats", window_label),
+                    self._kv_pair(
+                        "confirm",
+                        f"{config.diagnosis_confirm_cycles}/{config.recovery_confirm_cycles}",
+                    ),
+                    self._kv_pair("latency", f"{config.latency_warning_ms}/{config.latency_critical_ms}ms"),
+                    self._kv_pair("logging", config.logging_mode),
+                    self._kv_pair("rotate", rotation_label),
+                ],
                 width,
-            ),
-            "=" * width,
-        ]
+            )
+        )
+        header_lines.extend(
+            self._wrap_pairs(
+                "Rolling",
+                [
+                    self._kv_pair("checks", abbreviate_count(snapshot.session_window.checks)),
+                    self._kv_pair("ok", abbreviate_count(snapshot.session_window.successes), value_color="green"),
+                    self._kv_pair("fail", abbreviate_count(snapshot.session_window.failures), value_color="red"),
+                    self._kv_pair("dns", abbreviate_count(snapshot.session_window.dns_failures), value_color="yellow"),
+                    self._kv_pair("ping", abbreviate_count(snapshot.session_window.ping_failures), value_color="yellow"),
+                ],
+                width,
+            )
+        )
+        header_lines.extend(
+            self._wrap_pairs(
+                "Session",
+                [
+                    self._kv_pair("cycles", abbreviate_count(snapshot.session.cycles_completed)),
+                    self._kv_pair("checks", abbreviate_count(snapshot.session.total_checks)),
+                    self._kv_pair("ok", abbreviate_count(snapshot.session.successes), value_color="green"),
+                    self._kv_pair("fail", abbreviate_count(snapshot.session.failures), value_color="red"),
+                    self._kv_pair("dns", abbreviate_count(snapshot.session.dns_failures), value_color="yellow"),
+                    self._kv_pair("ping", abbreviate_count(snapshot.session.ping_failures), value_color="yellow"),
+                ],
+                width,
+            )
+        )
+        header_lines.append(self._rule(width, "="))
 
         table_lines = self._build_target_table(snapshot.target_stats, width, config)
 
         footer_lines = []
         if help_visible:
-            footer_lines.append(
-                shorten(
-                    "Keys: q quit | p pause | l logging | +/- check interval | </> ui refresh | a add | d delete | w fail window | t stats window | r reset | s snapshot | h help",
+            footer_lines.extend(
+                self._wrap_pairs(
+                    "Controls",
+                    [
+                        self._shortcut_pair("q", "quit"),
+                        self._shortcut_pair("p", "pause"),
+                        self._shortcut_pair("h", "help"),
+                        self._shortcut_pair("s", "snapshot"),
+                        self._shortcut_pair("r", "reset"),
+                    ],
                     width,
                 )
             )
-            footer_lines.append(shorten("Prompt mode: Enter submits, Esc cancels, Backspace edits.", width))
+            footer_lines.extend(
+                self._wrap_pairs(
+                    "Tuning",
+                    [
+                        self._shortcut_pair("l", "logging"),
+                        self._shortcut_pair("+/-", "check"),
+                        self._shortcut_pair("</>", "refresh"),
+                        self._shortcut_pair("w", "fail window" if width >= 92 else "fail win"),
+                        self._shortcut_pair("t", "stats window" if width >= 92 else "stats win"),
+                    ],
+                    width,
+                )
+            )
+            footer_lines.extend(
+                self._wrap_pairs(
+                    "Targets",
+                    [
+                        self._shortcut_pair("a", "add"),
+                        self._shortcut_pair("d", "delete"),
+                    ],
+                    width,
+                )
+            )
+            footer_lines.extend(
+                self._wrap_pairs(
+                    "Prompt",
+                    [
+                        ("Enter submit", "Enter submit"),
+                        ("Esc cancel", "Esc cancel"),
+                        ("Backspace edit", "Backspace edit"),
+                    ],
+                    width,
+                )
+            )
         else:
-            footer_lines.append(shorten("Press h for key help. q quits.", width))
+            footer_lines.extend(
+                self._wrap_pairs(
+                    "Help",
+                    [
+                        self._shortcut_pair("h", "show help"),
+                        self._shortcut_pair("q", "quit"),
+                    ],
+                    width,
+                )
+            )
 
         prompt_line = ""
         if prompt is not None:
-            prompt_line = shorten(
-                f"Prompt [{prompt.kind}]: {prompt.message} > {prompt.buffer}",
+            prompt_line = self._render_prompt_line(
+                f"{prompt.kind}: {prompt.message} > {prompt.buffer}",
                 width,
             )
 
-        static_line_count = len(header_lines) + len(table_lines) + len(footer_lines) + 4 + (1 if prompt_line else 0)
-        available_event_lines = min(config.visible_event_lines, max(3, height - static_line_count))
-        event_lines = self._build_event_panel(snapshot.recent_events, width, available_event_lines)
-        event_title = f"Recent events (last {min(len(snapshot.recent_events), available_event_lines)}/{len(snapshot.recent_events)})"
-
-        lines = []
-        lines.extend(header_lines)
-        lines.extend(table_lines)
-        lines.append("-" * width)
-        lines.append(shorten(event_title, width))
-        lines.extend(event_lines)
-        lines.append("-" * width)
-        lines.extend(footer_lines)
+        footer_block = [self._rule(width, "-")]
+        footer_block.extend(footer_lines)
         if prompt_line:
-            lines.append(prompt_line)
+            footer_block.append(prompt_line)
 
+        middle_capacity = max(0, height - len(header_lines) - len(footer_block))
+        middle_lines: list[str] = []
+        event_title = self._section_title(
+            "Events",
+            f"showing {shown_event_count}/{len(visible_events)}",
+            width,
+        )
+
+        if middle_capacity <= len(table_lines):
+            middle_lines.extend(table_lines[:middle_capacity])
+        else:
+            middle_lines.extend(table_lines)
+            remaining_after_table = middle_capacity - len(table_lines)
+            if remaining_after_table >= 3:
+                available_event_lines = min(config.visible_event_lines, remaining_after_table - 2)
+                event_lines = self._build_event_panel(visible_events, width, available_event_lines)
+                event_block = [self._rule(width, "-"), event_title]
+                event_block.extend(event_lines[:available_event_lines] if available_event_lines > 0 else [])
+                if len(event_block) > remaining_after_table:
+                    event_block = event_block[:remaining_after_table]
+                middle_lines.extend(event_block)
+            filler_count = max(0, middle_capacity - len(middle_lines))
+            middle_lines.extend([""] * filler_count)
+
+        lines = header_lines + middle_lines + footer_block
         return "\n".join(lines[:height])
 
     def build_report(self, snapshot: StateSnapshot, config: AppConfig, *, paused: bool) -> str:
@@ -1375,6 +1591,8 @@ class Renderer:
                 f"check_interval_seconds={config.check_interval_seconds}, ping_timeout_ms={config.ping_timeout_ms}, "
                 f"stats_window_seconds={config.stats_window_seconds}, "
                 f"ui_refresh_interval_seconds={config.ui_refresh_interval_seconds}, "
+                f"diagnosis_confirm_cycles={config.diagnosis_confirm_cycles}, "
+                f"recovery_confirm_cycles={config.recovery_confirm_cycles}, "
                 f"latency_warning_ms={config.latency_warning_ms}, latency_critical_ms={config.latency_critical_ms}, "
                 f"log_rotation_max_mb={config.log_rotation_max_mb}, log_rotation_keep_files={config.log_rotation_keep_files}, "
                 f"logging_mode={config.logging_mode}, around_failure={config.around_failure_before_seconds}/{config.around_failure_after_seconds}s, "
@@ -1387,9 +1605,10 @@ class Renderer:
             ),
             "",
         ]
+        visible_events = self._interesting_events(snapshot.recent_events)
         body = self._build_target_table(snapshot.target_stats, width, config, ansi=False)
         events = ["", "Recent events"] + self._build_event_panel(
-            snapshot.recent_events,
+            visible_events,
             width,
             min(15, config.visible_event_lines),
             ansi=False,
@@ -1417,6 +1636,92 @@ class Renderer:
             return text
         return f"\x1b[{';'.join(codes)}m{text}\x1b[0m"
 
+    def _rule(self, width: int, char: str) -> str:
+        line = char * width
+        return self.style(line, fg="blue", dim=True)
+
+    def _diagnosis_banner(self, diagnosis: str, width: int, color: str) -> str:
+        label = self.style("Diagnosis", fg=color, bold=True)
+        available = max(1, width - 11)
+        return f"{label}  {self.style(shorten(diagnosis, available), fg=color, bold=True)}"
+
+    def _section_title(self, title: str, subtitle: str = "", width: Optional[int] = None) -> str:
+        plain = f"{title}  {subtitle}".rstrip()
+        if width is not None:
+            plain = shorten(plain, width)
+        rendered_title = self.style(title, fg="cyan", bold=True)
+        if subtitle:
+            return f"{rendered_title}  {shorten(subtitle, width - len(title) - 2) if width else subtitle}".rstrip()
+        return rendered_title
+
+    def _kv_pair(
+        self,
+        key: str,
+        value: str,
+        *,
+        key_color: str = "white",
+        value_color: Optional[str] = None,
+    ) -> tuple[str, str]:
+        plain = f"{key} {value}"
+        rendered = (
+            f"{self.style(key, fg=key_color, dim=True)} "
+            f"{self.style(value, fg=value_color, bold=value_color is not None)}"
+        )
+        return plain, rendered
+
+    def _shortcut_pair(self, key: str, description: str) -> tuple[str, str]:
+        plain = f"[{key}] {description}"
+        rendered = f"{self.style(f'[{key}]', fg='yellow', bold=True)} {description}"
+        return plain, rendered
+
+    def _wrap_pairs(
+        self,
+        label: str,
+        segments: list[tuple[str, str]],
+        width: int,
+        *,
+        label_color: str = "cyan",
+    ) -> list[str]:
+        prefix_plain = f"{label:<8} "
+        prefix_rendered = self.style(f"{label:<8}", fg=label_color, bold=True) + " "
+        continuation_plain = " " * len(prefix_plain)
+        available = max(8, width - len(prefix_plain))
+        rows: list[list[tuple[str, str]]] = []
+        current_row: list[tuple[str, str]] = []
+        current_length = 0
+
+        for plain, rendered in segments:
+            if not plain:
+                continue
+            segment_length = len(plain)
+            separator_length = 2 if current_row else 0
+            if current_row and current_length + separator_length + segment_length > available:
+                rows.append(current_row)
+                current_row = [(plain, rendered)]
+                current_length = segment_length
+            else:
+                current_row.append((plain, rendered))
+                current_length += separator_length + segment_length
+
+        if current_row or not rows:
+            rows.append(current_row)
+
+        wrapped: list[str] = []
+        for index, row in enumerate(rows):
+            prefix = prefix_rendered if index == 0 else continuation_plain
+            content = "  ".join(rendered for _, rendered in row) if row else "-"
+            wrapped.append(prefix + content)
+        return wrapped
+
+    def _render_prompt_line(self, text: str, width: int) -> str:
+        prompt_prefix_plain = f"{'Prompt':<8} "
+        prompt_prefix_rendered = self.style(f"{'Prompt':<8}", fg="magenta", bold=True) + " "
+        plain = prompt_prefix_plain + text
+        if len(plain) > width:
+            shortened = shorten(text, max(1, width - len(prompt_prefix_plain)))
+            return prompt_prefix_rendered + shortened
+        return prompt_prefix_rendered + text
+
     def _build_target_table(
         self,
         stats_list: list[TargetStats],
@@ -1429,12 +1734,17 @@ class Renderer:
         original_ansi = self.ansi
         self.ansi = use_ansi
         try:
-            lines = ["Targets"]
+            window_label = format_compact_span(config.stats_window_seconds)
+            loss_header = f"{window_label} Loss%"
+            ratio_header = f"{window_label} OK/Fail"
+            loss_width = max(8, len(loss_header))
+            ratio_width = max(13, len(ratio_header))
+            lines = [self.style("Targets", fg="cyan", bold=True)]
             header = (
                 f"{'Idx':>3} {'Target':24} {'Type':8} {'State':10} {'Latency':>9} "
-                f"{'Consec':>6} {'WinLoss%':>8} {'Win OK/Fail':>13} {'Last IP':18}  Error"
+                f"{'Consec':>6} {loss_header:>{loss_width}} {ratio_header:>{ratio_width}} {'Last IP':18}  Error"
             )
-            lines.append(shorten(header, width))
+            lines.append(self.style(shorten(header, width), fg="white", dim=True))
             if not stats_list:
                 lines.append("  - no targets configured")
                 return lines
@@ -1458,9 +1768,9 @@ class Renderer:
                     fg="red" if stats.consecutive_failures > 0 else "green",
                     bold=stats.consecutive_failures > 0,
                 )
-                loss_plain = f"{stats.window_summary.loss_percentage:>7.1f}%"
+                loss_plain = f"{stats.window_summary.loss_percentage:>{loss_width - 1}.1f}%"
                 loss_text = self.style(loss_plain, fg=self._loss_color(stats.window_summary.loss_percentage))
-                ok_fail_plain = f"{abbreviate_ratio(stats.window_summary.successes, stats.window_summary.failures):>13}"
+                ok_fail_plain = f"{abbreviate_ratio(stats.window_summary.successes, stats.window_summary.failures):>{ratio_width}}"
                 ok_fail_text = self.style(
                     ok_fail_plain,
                     fg="red" if stats.window_summary.failures > 0 else "green",
@@ -1468,7 +1778,8 @@ class Renderer:
                 error_text = stats.last_error_category if stats.last_error_category not in ("", "ok") else "-"
                 if stats.last_error_message and stats.last_error_category not in ("", "ok"):
                     error_text = f"{stats.last_error_category}: {stats.last_error_message}"
-                error_text = shorten(error_text, max(10, width - 104))
+                fixed_width = 3 + 1 + 24 + 1 + 8 + 1 + 10 + 1 + 9 + 1 + 6 + 1 + loss_width + 1 + ratio_width + 1 + 18 + 2
+                error_text = shorten(error_text, max(10, width - fixed_width))
                 if error_text != "-":
                     error_text = self.style(error_text, fg="red", bold=True)
                 line = (
@@ -1501,7 +1812,7 @@ class Renderer:
         self.ansi = use_ansi
         try:
             if not events:
-                return ["  - no events yet"]
+                return [self.style("  - no notable failures, recoveries, or config changes yet", fg="white", dim=True)]
             selected = events[-available_lines:]
             lines = []
             for event in selected:
@@ -1516,6 +1827,34 @@ class Renderer:
             return lines
         finally:
             self.ansi = original_ansi
+
+    def _interesting_events(self, events: list[EventEntry]) -> list[EventEntry]:
+        interesting: list[EventEntry] = []
+        for event in events:
+            if self._is_interesting_event(event):
+                interesting.append(event)
+        return interesting
+
+    def _is_interesting_event(self, event: EventEntry) -> bool:
+        if event.level in ("warn", "error"):
+            return True
+        message = event.message
+        notable_prefixes = (
+            "Diagnosis changed:",
+            "Monitoring ",
+            "Counters reset",
+            "Snapshot saved to ",
+            "Added target ",
+            "Deleted target ",
+            "Logging mode set to ",
+            "Check interval set to ",
+            "UI refresh interval set to ",
+            "Around-failure window set to ",
+            "Stats window ",
+        )
+        if message.startswith(notable_prefixes):
+            return True
+        return " recovered (" in message
 
     def _state_color(self, stats: TargetStats) -> str:
         if stats.last_state == "up":
