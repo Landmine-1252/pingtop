@@ -92,6 +92,7 @@ For hostnames, `pingtop` resolves DNS first and then pings the resolved IP. That
 - `t`: change the rolling stats window
 - `r`: reset counters
 - `s`: save a snapshot report
+- `u`: open the project release/review page in your browser
 - `h`: show/hide help
 
 Prompt mode stays inside the UI. `Enter` submits, `Esc` cancels, and `Backspace` edits the prompt text.
@@ -105,6 +106,17 @@ Prompt mode stays inside the UI. `Enter` submits, `Esc` cancels, and `Backspace`
 Around-failure logging defaults to `15` seconds before and `15` seconds after a failure. Overlapping failures extend the active capture window instead of fragmenting it.
 
 `pingtop_log.csv` also rotates automatically by size. When the active log reaches `log_rotation_max_mb`, it is renamed to a timestamped file such as `pingtop_log_20260307_130500.csv`, a fresh `pingtop_log.csv` is created, and older rotated logs beyond `log_rotation_keep_files` are deleted.
+
+## Update Checks
+
+`pingtop` can do a simple GitHub release metadata check in the background when the UI starts.
+
+- it does not download or install updates
+- it only checks whether a newer tagged release exists
+- if a newer version is available, the UI shows it and logs an event
+- press `u` to open the project release/review page in your browser so you can inspect it yourself
+
+This keeps updates simple and conservative: notification only, no self-modifying behavior.
 
 ## Accuracy and Diagnosis
 
@@ -128,6 +140,8 @@ This keeps the tool useful for intermittent problems without overreacting to a s
   "ping_timeout_ms": 1200,
   "ui_refresh_interval_seconds": 0.5,
   "stats_window_seconds": 3600,
+  "update_check_enabled": true,
+  "update_repo_url": "https://github.com/Landmine-1252/pingtop",
   "diagnosis_confirm_cycles": 2,
   "recovery_confirm_cycles": 2,
   "latency_warning_ms": 100,

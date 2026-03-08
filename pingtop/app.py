@@ -14,7 +14,9 @@ from .network import CheckCoordinator, PingRunner
 from .paths import RuntimePaths, resolve_runtime_paths
 from .state import StateStore
 from .ui import PingTopUI
+from .updates import UpdateManager
 from .util import format_latency, human_error_message, now_local_iso
+from .version import __version__
 
 
 @dataclass
@@ -24,6 +26,7 @@ class AppServices:
     state_store: StateStore
     logger: CSVLogger
     coordinator: CheckCoordinator
+    update_manager: UpdateManager
 
 
 def build_services(runtime_paths: RuntimePaths) -> AppServices:
@@ -31,12 +34,19 @@ def build_services(runtime_paths: RuntimePaths) -> AppServices:
     state_store = StateStore(config_manager.snapshot())
     logger = CSVLogger(runtime_paths.log_path)
     coordinator = CheckCoordinator(PingRunner())
+    config = config_manager.snapshot()
+    update_manager = UpdateManager(
+        current_version=f"v{__version__}",
+        repo_url=config.update_repo_url,
+        enabled=config.update_check_enabled,
+    )
     return AppServices(
         runtime_paths=runtime_paths,
         config_manager=config_manager,
         state_store=state_store,
         logger=logger,
         coordinator=coordinator,
+        update_manager=update_manager,
     )
 
 
@@ -142,6 +152,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             services.state_store,
             services.logger,
             services.coordinator,
+            services.update_manager,
         ).run()
         print(build_exit_summary(services.state_store.snapshot()))
         return result

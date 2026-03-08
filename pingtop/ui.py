@@ -13,6 +13,7 @@ from .monitor import BackgroundMonitor
 from .network import CheckCoordinator
 from .paths import RuntimePaths
 from .state import StateStore
+from .updates import UpdateManager, UpdateStatus
 from .util import (
     abbreviate_count,
     abbreviate_ratio,
@@ -83,6 +84,7 @@ class Renderer:
         paused: bool,
         help_visible: bool,
         prompt: Optional[PromptState],
+        update_status: Optional[UpdateStatus] = None,
     ) -> str:
         terminal_size = shutil.get_terminal_size((140, 42))
         width = max(40, terminal_size.columns)
@@ -113,6 +115,11 @@ class Renderer:
                 "Status",
                 [
                     self._kv_pair("mode", status, value_color=status_color),
+                    self._kv_pair(
+                        "update",
+                        self._update_status_text(update_status),
+                        value_color=self._update_status_color(update_status),
+                    ),
                     self._kv_pair("events", f"{shown_event_count}/{len(visible_events)}"),
                     self._kv_pair(
                         "last",
@@ -195,6 +202,7 @@ class Renderer:
                         self._shortcut_pair("h", "help"),
                         self._shortcut_pair("s", "snapshot"),
                         self._shortcut_pair("r", "reset"),
+                        self._shortcut_pair("u", "updates"),
                     ],
                     width,
                 )
@@ -641,6 +649,22 @@ class Renderer:
             return "yellow"
         return "cyan"
 
+    def _update_status_text(self, update_status: Optional[UpdateStatus]) -> str:
+        if update_status is None:
+            return "-"
+        return update_status.summary()
+
+    def _update_status_color(self, update_status: Optional[UpdateStatus]) -> Optional[str]:
+        if update_status is None:
+            return None
+        if update_status.state == "available":
+            return "yellow"
+        if update_status.state == "current":
+            return "green"
+        if update_status.state in ("checking", "disabled"):
+            return None
+        return "red"
+
     def _enable_windows_ansi(self) -> bool:
         try:
             kernel32 = ctypes.windll.kernel32
@@ -664,32 +688,38 @@ class PingTopUI:
         state_store: StateStore,
         logger: CSVLogger,
         coordinator: CheckCoordinator,
+        update_manager: UpdateManager,
     ) -> None:
         self.runtime_paths = runtime_paths
         self.config_manager = config_manager
         self.state_store = state_store
         self.logger = logger
         self.coordinator = coordinator
+        self.update_manager = update_manager
         self.monitor = BackgroundMonitor(config_manager, state_store, logger, coordinator)
         self.renderer = Renderer()
         self.help_visible = True
         self.prompt: Optional[PromptState] = None
         self.running = True
+        self.last_update_state = ""
 
         if self.config_manager.load_warning:
             self.state_store.add_event("warn", self.config_manager.load_warning)
 
     def run(self) -> int:
+        self.update_manager.start()
         self.monitor.start()
         try:
             self.renderer.enter()
             with create_input_handler() as input_handler:
                 while self.running:
                     config = self.config_manager.snapshot()
+                    self._sync_update_status()
                     self._draw_frame(config)
                     for key in input_handler.read_keys(config.ui_refresh_interval_seconds):
                         self.handle_key(key)
                         if self.running:
+                            self._sync_update_status()
                             self._draw_frame()
         except KeyboardInterrupt:
             self.running = False
@@ -708,8 +738,22 @@ class PingTopUI:
             paused=self.monitor.is_paused(),
             help_visible=self.help_visible,
             prompt=self.prompt,
+            update_status=self.update_manager.snapshot(),
         )
         self.renderer.draw(screen)
+
+    def _sync_update_status(self) -> None:
+        status = self.update_manager.snapshot()
+        if status.state == self.last_update_state:
+            return
+        self.last_update_state = status.state
+        if status.state == "available":
+            self.state_store.add_event(
+                "info",
+                f"Update available: {status.latest_version} (press u to review release)",
+            )
+        elif status.state == "error":
+            self.state_store.add_event("warn", f"Update check failed: {shorten(status.error_message, 120)}")
 
     def handle_key(self, key: str) -> None:
         if key == "\x03":
@@ -751,6 +795,8 @@ class PingTopUI:
         elif key.lower() == "s":
             path = self._save_snapshot_report()
             self.state_store.add_event("info", f"Snapshot saved to {path.name}")
+        elif key.lower() == "u":
+            self._open_update_page()
         elif key.lower() == "h":
             self.help_visible = not self.help_visible
 
@@ -912,3 +958,14 @@ class PingTopUI:
             encoding="utf-8",
         )
         return path
+
+    def _open_update_page(self) -> None:
+        status = self.update_manager.snapshot()
+        ok, message = self.update_manager.open_page()
+        if ok:
+            if status.is_available and status.latest_version:
+                self.state_store.add_event("info", f"Opened release page for {status.latest_version}")
+            else:
+                self.state_store.add_event("info", "Opened project updates page")
+        else:
+            self.state_store.add_event("warn", message)

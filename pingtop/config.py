@@ -28,6 +28,8 @@ class AppConfig:
     ping_timeout_ms: int = 1200
     ui_refresh_interval_seconds: float = 0.5
     stats_window_seconds: int = 3600
+    update_check_enabled: bool = True
+    update_repo_url: str = "https://github.com/Landmine-1252/pingtop"
     diagnosis_confirm_cycles: int = 2
     recovery_confirm_cycles: int = 2
     latency_warning_ms: int = 100
@@ -67,6 +69,8 @@ class AppConfig:
                 data.get("ui_refresh_interval_seconds", base.ui_refresh_interval_seconds)
             ),
             stats_window_seconds=int(data.get("stats_window_seconds", base.stats_window_seconds)),
+            update_check_enabled=bool(data.get("update_check_enabled", base.update_check_enabled)),
+            update_repo_url=str(data.get("update_repo_url", base.update_repo_url)),
             diagnosis_confirm_cycles=int(
                 data.get("diagnosis_confirm_cycles", base.diagnosis_confirm_cycles)
             ),
@@ -100,6 +104,8 @@ class AppConfig:
             2,
         )
         self.stats_window_seconds = int(clamp(float(self.stats_window_seconds), 30.0, 2_592_000.0))
+        self.update_check_enabled = bool(self.update_check_enabled)
+        self.update_repo_url = str(self.update_repo_url or "").strip().rstrip("/")
         self.diagnosis_confirm_cycles = int(clamp(float(self.diagnosis_confirm_cycles), 1.0, 10.0))
         self.recovery_confirm_cycles = int(clamp(float(self.recovery_confirm_cycles), 1.0, 10.0))
         self.latency_warning_ms = int(clamp(float(self.latency_warning_ms), 10.0, 10000.0))
@@ -140,6 +146,8 @@ class AppConfig:
             "ping_timeout_ms": self.ping_timeout_ms,
             "ui_refresh_interval_seconds": self.ui_refresh_interval_seconds,
             "stats_window_seconds": self.stats_window_seconds,
+            "update_check_enabled": self.update_check_enabled,
+            "update_repo_url": self.update_repo_url,
             "diagnosis_confirm_cycles": self.diagnosis_confirm_cycles,
             "recovery_confirm_cycles": self.recovery_confirm_cycles,
             "latency_warning_ms": self.latency_warning_ms,
