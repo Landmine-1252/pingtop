@@ -124,7 +124,7 @@ This keeps the tool useful for intermittent problems without overreacting to a s
 ```json
 {
   "version": 1,
-  "check_interval_seconds": 5.0,
+  "check_interval_seconds": 1.0,
   "ping_timeout_ms": 1200,
   "ui_refresh_interval_seconds": 0.5,
   "stats_window_seconds": 3600,

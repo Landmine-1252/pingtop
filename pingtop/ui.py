@@ -245,17 +245,8 @@ class Renderer:
                 )
             )
 
-        prompt_line = ""
-        if prompt is not None:
-            prompt_line = self._render_prompt_line(
-                f"{prompt.kind}: {prompt.message} > {prompt.buffer}",
-                width,
-            )
-
         footer_block = [self._rule(width, "-")]
         footer_block.extend(footer_lines)
-        if prompt_line:
-            footer_block.append(prompt_line)
 
         middle_capacity = max(0, height - len(header_lines) - len(footer_block))
         middle_lines: list[str] = []
@@ -282,6 +273,8 @@ class Renderer:
             middle_lines.extend([""] * filler_count)
 
         lines = header_lines + middle_lines + footer_block
+        if prompt is not None:
+            lines = self._overlay_prompt(lines, width, height, prompt)
         return "\n".join(lines[:height])
 
     def build_report(self, snapshot: StateSnapshot, config: AppConfig, *, paused: bool) -> str:
@@ -414,14 +407,79 @@ class Renderer:
             wrapped.append(prefix + content)
         return wrapped
 
-    def _render_prompt_line(self, text: str, width: int) -> str:
-        prompt_prefix_plain = f"{'Prompt':<8} "
-        prompt_prefix_rendered = self.style(f"{'Prompt':<8}", fg="magenta", bold=True) + " "
-        plain = prompt_prefix_plain + text
-        if len(plain) > width:
-            shortened = shorten(text, max(1, width - len(prompt_prefix_plain)))
-            return prompt_prefix_rendered + shortened
-        return prompt_prefix_rendered + text
+    def _overlay_prompt(
+        self,
+        lines: list[str],
+        width: int,
+        height: int,
+        prompt: PromptState,
+    ) -> list[str]:
+        padded = list(lines[:height])
+        if len(padded) < height:
+            padded.extend([""] * (height - len(padded)))
+
+        box_width = min(max(46, width - 10), 88)
+        box_width = min(box_width, max(28, width - 2))
+        inner_width = max(18, box_width - 4)
+        box_height = 7
+        if height < box_height + 2:
+            return padded
+
+        title = self._prompt_title(prompt.kind)
+        message = shorten(prompt.message, inner_width)
+        visible_input = self._tail_shorten(prompt.buffer, max(1, inner_width - 2))
+        input_line = f"> {visible_input or '_'}"
+        hint = "Enter submit | Esc cancel | Backspace edit"
+        hint = shorten(hint, inner_width)
+
+        box_lines = [
+            "+" + "-" * (box_width - 2) + "+",
+            f"| {shorten(title, inner_width):<{inner_width}} |",
+            f"| {message:<{inner_width}} |",
+            "|" + " " * (box_width - 2) + "|",
+            f"| {input_line:<{inner_width}} |",
+            f"| {hint:<{inner_width}} |",
+            "+" + "-" * (box_width - 2) + "+",
+        ]
+        styled_lines = [
+            self.style(box_lines[0], fg="magenta", bold=True),
+            self.style(f"| {shorten(title, inner_width):<{inner_width}} |", fg="magenta", bold=True),
+            self.style(f"| {message:<{inner_width}} |", fg="white"),
+            self.style("|" + " " * (box_width - 2) + "|", fg="magenta"),
+            self.style(f"| {input_line:<{inner_width}} |", fg="yellow", bold=True),
+            self.style(f"| {hint:<{inner_width}} |", fg="cyan"),
+            self.style(box_lines[-1], fg="magenta", bold=True),
+        ]
+
+        top = max(1, (height - box_height) // 2)
+        left = max(0, (width - box_width) // 2)
+        right_padding = max(0, width - left - box_width)
+        for index, box_line in enumerate(styled_lines):
+            target_index = top + index
+            if target_index >= len(padded):
+                break
+            padded[target_index] = (" " * left) + box_line + (" " * right_padding)
+        return padded
+
+    def _prompt_title(self, kind: str) -> str:
+        if kind == "add":
+            return "Add Target"
+        if kind == "delete":
+            return "Delete Target"
+        if kind == "window":
+            return "Around-Failure Window"
+        if kind == "stats_window":
+            return "Stats Window"
+        return "Prompt"
+
+    def _tail_shorten(self, text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        if len(text) <= width:
+            return text
+        if width <= 3:
+            return text[-width:]
+        return "..." + text[-(width - 3) :]
 
     def _build_target_table(
         self,
@@ -628,23 +686,30 @@ class PingTopUI:
             with create_input_handler() as input_handler:
                 while self.running:
                     config = self.config_manager.snapshot()
-                    snapshot = self.state_store.snapshot()
-                    screen = self.renderer.build_screen(
-                        snapshot,
-                        config,
-                        paused=self.monitor.is_paused(),
-                        help_visible=self.help_visible,
-                        prompt=self.prompt,
-                    )
-                    self.renderer.draw(screen)
+                    self._draw_frame(config)
                     for key in input_handler.read_keys(config.ui_refresh_interval_seconds):
                         self.handle_key(key)
+                        if self.running:
+                            self._draw_frame()
         except KeyboardInterrupt:
             self.running = False
         finally:
             self.monitor.stop()
             self.renderer.leave()
         return 0
+
+    def _draw_frame(self, config: Optional[AppConfig] = None) -> None:
+        if config is None:
+            config = self.config_manager.snapshot()
+        snapshot = self.state_store.snapshot()
+        screen = self.renderer.build_screen(
+            snapshot,
+            config,
+            paused=self.monitor.is_paused(),
+            help_visible=self.help_visible,
+            prompt=self.prompt,
+        )
+        self.renderer.draw(screen)
 
     def handle_key(self, key: str) -> None:
         if key == "\x03":

@@ -24,7 +24,7 @@ LOGGING_MODES = ("all", "failures_only", "around_failure")
 @dataclass
 class AppConfig:
     version: int = 1
-    check_interval_seconds: float = 5.0
+    check_interval_seconds: float = 1.0
     ping_timeout_ms: int = 1200
     ui_refresh_interval_seconds: float = 0.5
     stats_window_seconds: int = 3600

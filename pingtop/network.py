@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import re
 import socket
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Optional
 
 from .config import DEFAULT_TARGET_VALUES, AppConfig
@@ -80,7 +82,7 @@ class PingRunner:
         return shorten(text, 180)
 
 
-def resolve_hostname(hostname: str) -> tuple[bool, str, str]:
+def _blocking_resolve_hostname(hostname: str) -> tuple[bool, str, str]:
     try:
         infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
@@ -96,11 +98,102 @@ def resolve_hostname(hostname: str) -> tuple[bool, str, str]:
     return True, preferred, ""
 
 
+@dataclass
+class PendingDNSLookup:
+    thread: threading.Thread
+    result_queue: "queue.Queue[tuple[bool, str, str]]"
+    timeout_ms: int
+
+
+class DNSResolver:
+    def __init__(self, lookup_func=None) -> None:
+        self.lookup_func = lookup_func or _blocking_resolve_hostname
+        self.lock = threading.RLock()
+        self.pending: dict[str, PendingDNSLookup] = {}
+
+    def resolve(self, hostname: str, timeout_ms: int) -> tuple[bool, str, str]:
+        pending = self._get_pending(hostname)
+        if pending is not None:
+            harvested = self._harvest_completed(hostname, pending)
+            if harvested is not None:
+                return harvested
+            if pending.thread.is_alive():
+                return False, "", f"dns lookup still pending after {pending.timeout_ms} ms timeout"
+
+        pending = self._start_lookup(hostname, timeout_ms)
+        try:
+            result = pending.result_queue.get(timeout=max(0.05, timeout_ms / 1000.0))
+        except queue.Empty:
+            return False, "", f"dns lookup exceeded {timeout_ms} ms timeout"
+        with self.lock:
+            current = self.pending.get(hostname)
+            if current is pending:
+                self.pending.pop(hostname, None)
+        return result
+
+    def _get_pending(self, hostname: str) -> Optional[PendingDNSLookup]:
+        with self.lock:
+            return self.pending.get(hostname)
+
+    def _harvest_completed(
+        self,
+        hostname: str,
+        pending: PendingDNSLookup,
+    ) -> Optional[tuple[bool, str, str]]:
+        if pending.thread.is_alive():
+            return None
+        try:
+            result = pending.result_queue.get_nowait()
+        except queue.Empty:
+            result = None
+        with self.lock:
+            current = self.pending.get(hostname)
+            if current is pending:
+                self.pending.pop(hostname, None)
+        return result
+
+    def _start_lookup(self, hostname: str, timeout_ms: int) -> PendingDNSLookup:
+        result_queue: "queue.Queue[tuple[bool, str, str]]" = queue.Queue(maxsize=1)
+        thread = threading.Thread(
+            target=self._worker,
+            args=(hostname, result_queue),
+            name=f"dns-{shorten(hostname, 20)}",
+            daemon=True,
+        )
+        pending = PendingDNSLookup(
+            thread=thread,
+            result_queue=result_queue,
+            timeout_ms=timeout_ms,
+        )
+        with self.lock:
+            self.pending[hostname] = pending
+        thread.start()
+        return pending
+
+    def _worker(self, hostname: str, result_queue: "queue.Queue[tuple[bool, str, str]]") -> None:
+        try:
+            result = self.lookup_func(hostname)
+        except Exception as exc:
+            result = (False, "", str(exc))
+        try:
+            result_queue.put_nowait(result)
+        except queue.Full:
+            return
+
+
+_DEFAULT_DNS_RESOLVER = DNSResolver()
+
+
+def resolve_hostname(hostname: str, timeout_ms: int = 1200) -> tuple[bool, str, str]:
+    return _DEFAULT_DNS_RESOLVER.resolve(hostname, timeout_ms)
+
+
 class CheckCoordinator:
-    def __init__(self, ping_runner: PingRunner) -> None:
+    def __init__(self, ping_runner: PingRunner, dns_resolver: Optional[DNSResolver] = None) -> None:
         worker_count = max(4, min(32, len(DEFAULT_TARGET_VALUES) * 2))
         self.executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="checker")
         self.ping_runner = ping_runner
+        self.dns_resolver = dns_resolver or _DEFAULT_DNS_RESOLVER
 
     def close(self) -> None:
         self.executor.shutdown(wait=True, cancel_futures=False)
@@ -156,8 +249,10 @@ class CheckCoordinator:
                 worker_id=worker_name,
             )
 
-        dns_success, resolved_ip, dns_error = resolve_hostname(target.value)
+        dns_success, resolved_ip, dns_error = self.dns_resolver.resolve(target.value, timeout_ms)
         if not dns_success:
+            lowered = dns_error.lower()
+            dns_category = "dns_timeout" if "timeout" in lowered or "pending" in lowered else "dns_failure"
             return CheckResult(
                 cycle_id=cycle_id,
                 timestamp=time.time(),
@@ -167,7 +262,7 @@ class CheckCoordinator:
                 dns_success=False,
                 ping_success=False,
                 latency_ms=None,
-                error_category="dns_failure",
+                error_category=dns_category,
                 error_message=shorten(dns_error, 180),
                 worker_id=worker_name,
             )

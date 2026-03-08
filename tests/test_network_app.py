@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -8,7 +9,7 @@ from unittest import mock
 from pingtop.app import run_headless
 from pingtop.config import AppConfig
 from pingtop.models import CheckResult, SessionTotals, StateSnapshot
-from pingtop.network import CheckCoordinator, PingRunner, resolve_hostname
+from pingtop.network import CheckCoordinator, DNSResolver, PingRunner, resolve_hostname
 
 
 class NetworkTests(unittest.TestCase):
@@ -30,12 +31,35 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(address, "104.16.133.229")
         self.assertEqual(error, "")
 
-    @mock.patch("pingtop.network.resolve_hostname")
-    def test_check_coordinator_orchestrates_dns_then_ping(self, resolve_hostname_mock: mock.Mock) -> None:
+    def test_dns_resolver_times_out_without_spawning_duplicate_lookups(self) -> None:
+        calls: list[str] = []
+
+        def slow_lookup(hostname: str) -> tuple[bool, str, str]:
+            calls.append(hostname)
+            time.sleep(0.2)
+            return False, "", "slow failure"
+
+        resolver = DNSResolver(lookup_func=slow_lookup)
+        ok, _, error = resolver.resolve("hhh", 50)
+        self.assertFalse(ok)
+        self.assertIn("exceeded 50 ms timeout", error)
+
+        ok, _, error = resolver.resolve("hhh", 50)
+        self.assertFalse(ok)
+        self.assertIn("still pending", error)
+        self.assertEqual(calls, ["hhh"])
+
+        time.sleep(0.25)
+        ok, _, error = resolver.resolve("hhh", 50)
+        self.assertFalse(ok)
+        self.assertEqual(error, "slow failure")
+
+    def test_check_coordinator_orchestrates_dns_then_ping(self) -> None:
         ping_runner = mock.Mock()
         ping_runner.ping.return_value = (True, 18.5, "ok", "")
-        coordinator = CheckCoordinator(ping_runner)
-        resolve_hostname_mock.return_value = (True, "104.16.133.229", "")
+        dns_resolver = mock.Mock()
+        dns_resolver.resolve.return_value = (True, "104.16.133.229", "")
+        coordinator = CheckCoordinator(ping_runner, dns_resolver=dns_resolver)
 
         ip_result = coordinator._check_target(mock.Mock(value="1.1.1.1", kind="ip"), 1200, 1)
         host_result = coordinator._check_target(mock.Mock(value="cloudflare.com", kind="hostname"), 1200, 1)
@@ -44,6 +68,7 @@ class NetworkTests(unittest.TestCase):
         self.assertTrue(host_result.dns_success)
         self.assertEqual(host_result.resolved_ip, "104.16.133.229")
         self.assertEqual(ping_runner.ping.call_count, 2)
+        dns_resolver.resolve.assert_called_once_with("cloudflare.com", 1200)
         coordinator.close()
 
 
