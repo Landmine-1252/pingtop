@@ -1,1 +1,8 @@
 pingtop_log.csv
+pingtop_log_*.csv
+pingtop_snapshot_*.txt
+
+__pycache__/
+*.py[cod]
+
+dist/

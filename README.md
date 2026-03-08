@@ -1,41 +1,83 @@
 # pingtop
 
-`pingtop` is a Python-only terminal tool for separating intermittent failures into three buckets:
+`pingtop` is a stdlib-only terminal tool for separating intermittent connectivity problems into a few practical buckets:
 
 - likely general network failure
 - likely DNS failure
 - isolated host or path failure
 
-It uses only the Python standard library, shells out to the system `ping` command for ICMP checks, and stores config, logs, and snapshot reports next to the script.
+It uses Python DNS resolution via `socket.getaddrinfo`, shells out to the system `ping` command for ICMP checks, and keeps config, CSV logs, rotated logs, and snapshot reports beside the launched script or launched `.pyz`.
 
-## Files
+## Source Layout
 
-- `pingtop.py`: main application
-- `pingtop.json`: persisted settings and target list
-- `pingtop_log.csv`: CSV log output
-- `pingtop_snapshot_YYYYMMDD_HHMMSS.txt`: manual snapshots created with `s`
+The source is now split into a small set of cohesive modules instead of one large script:
+
+- `pingtop.py`: thin local development entrypoint
+- `pingtop/__main__.py`: entrypoint for `python -m pingtop` and the `.pyz`
+- `pingtop/app.py`: app orchestration, argument parsing, headless modes
+- `pingtop/paths.py`: runtime path resolution
+- `pingtop/config.py`: config schema, normalization, persistence
+- `pingtop/models.py`: dataclasses for targets, results, events, stats
+- `pingtop/diagnosis.py`: cycle diagnosis logic
+- `pingtop/state.py`: rolling counters and in-memory app state
+- `pingtop/network.py`: DNS resolution, ping execution, threaded checks
+- `pingtop/logging_csv.py`: CSV logging, around-failure buffering, rotation
+- `pingtop/monitor.py`: background scheduler
+- `pingtop/input.py`: portable keyboard input
+- `pingtop/ui.py`: ANSI renderer and interactive controller
+- `scripts/build_pyz.py`: stdlib-only zipapp build script
+- `tests/`: focused `unittest` coverage
+
+## Runtime Files
+
+Runtime files keep their existing names:
+
+- config: `pingtop.json`
+- main CSV log: `pingtop_log.csv`
+- snapshots: `pingtop_snapshot_YYYYMMDD_HHMMSS.txt`
+
+These files are resolved from the launched artifact path, not from `__file__`.
+
+That matters for `.pyz`: inside a zipapp, `__file__` points into the archive, which is not where writable runtime files belong. `pingtop/paths.py` centralizes this logic so:
+
+- `python pingtop.py` writes beside `pingtop.py`
+- `python -m pingtop` writes beside the source checkout entrypoint context, not inside `pingtop/__main__.py`
+- `python dist/pingtop.pyz` writes beside `dist/pingtop.pyz`
 
 ## Run
 
+Local development from source:
+
 ```bash
 python pingtop.py
-```
-
-Useful smoke-test modes:
-
-```bash
 python pingtop.py --once
 python pingtop.py --no-ui
+python -m pingtop
+python -m pingtop --once
 ```
 
-`--once` runs a single concurrent check cycle and exits. `--no-ui` keeps monitoring without the full-screen ANSI UI.
+Build the single-file artifact:
+
+```bash
+python scripts/build_pyz.py
+```
+
+This is the local build command for the deployable zipapp. It creates `dist/pingtop.pyz`.
+
+Run the built artifact:
+
+```bash
+python dist/pingtop.pyz
+python dist/pingtop.pyz --once
+python dist/pingtop.pyz --no-ui
+```
 
 ## Default Targets
 
 - IPs: `1.1.1.1`, `8.8.8.8`
 - Hostnames: `google.com`, `cloudflare.com`, `microsoft.com`
 
-For hostnames, `pingtop` does DNS resolution with `socket.getaddrinfo` first and then pings the resolved IP. That keeps DNS failures separate from reachability failures.
+For hostnames, `pingtop` resolves DNS first and then pings the resolved IP. That keeps DNS failures separate from reachability failures.
 
 ## Controls
 
@@ -44,70 +86,40 @@ For hostnames, `pingtop` does DNS resolution with `socket.getaddrinfo` first and
 - `l`: cycle logging mode
 - `+` or `=` / `-` or `_`: adjust check interval
 - `>` or `.` / `<` or `,`: adjust UI refresh interval
-- `a`: add a target using the in-app prompt
-- `d`: delete a target by index or exact target value
-- `w`: change the around-failure pre/post window
+- `a`: add a target
+- `d`: delete a target
+- `w`: change the around-failure window
 - `t`: change the rolling stats window
 - `r`: reset counters
 - `s`: save a snapshot report
 - `h`: show/hide help
 
 Prompt mode stays inside the UI. `Enter` submits, `Esc` cancels, and `Backspace` edits the prompt text.
-Duration prompts accept plain seconds or `s` / `m` / `h` / `d` suffixes, for example `30s`, `15m`, or `1h`.
-
-The UI uses ANSI color only, no extra library:
-
-- green: healthy state / low latency
-- yellow: warnings and elevated latency
-- red: failures, high latency, and error text
-
-`pingtop` now prefers confirmation over fast diagnosis changes:
-
-- failure diagnoses are confirmed after `diagnosis_confirm_cycles` consecutive matching cycles
-- recovery back to green is confirmed after `recovery_confirm_cycles` consecutive healthy cycles
-- until then, the diagnosis banner shows a `Suspected ...` or `Recovery observed, confirming stability ...` message
 
 ## Logging Modes
 
 - `all`: write every result row to `pingtop_log.csv`
-- `failures_only`: write only failed checks
-- `around_failure`: keep an in-memory rolling pre-failure buffer and write the buffered rows plus the active post-failure window
+- `failures_only`: write only failures
+- `around_failure`: keep a rolling in-memory pre-failure buffer and capture post-failure results too
 
-The default around-failure window is `15` seconds before and `15` seconds after a failure. Overlapping failures extend the active capture window instead of fragmenting it.
+Around-failure logging defaults to `15` seconds before and `15` seconds after a failure. Overlapping failures extend the active capture window instead of fragmenting it.
 
-`pingtop_log.csv` also rotates automatically by size. When the active log reaches `log_rotation_max_mb`, it is renamed to a timestamped file such as `pingtop_log_20260307_130500.csv`, a new `pingtop_log.csv` is started, and old rotated logs beyond `log_rotation_keep_files` are deleted.
+`pingtop_log.csv` also rotates automatically by size. When the active log reaches `log_rotation_max_mb`, it is renamed to a timestamped file such as `pingtop_log_20260307_130500.csv`, a fresh `pingtop_log.csv` is created, and older rotated logs beyond `log_rotation_keep_files` are deleted.
 
-The live event panel is intentionally selective. It prioritizes failures, recoveries, diagnosis changes, and meaningful in-app setting changes instead of showing every low-value info message.
+## Accuracy and Diagnosis
 
-## Stats Window
+`pingtop` uses per-cycle heuristics, but it now prefers conservative conclusions over single-probe noise:
 
-The main counters shown in the UI are rolling-window counters instead of lifetime-only counters.
+- general network and DNS diagnoses prefer corroboration from multiple similar targets
+- failure diagnoses require `diagnosis_confirm_cycles` consecutive matching cycles
+- recovery back to green requires `recovery_confirm_cycles` consecutive healthy cycles
+- before confirmation, the banner shows `Suspected ...` or `Recovery observed, confirming stability ...`
 
-- `stats_window_seconds` controls the rolling window length
-- default is `3600` seconds (`1h`)
-- the UI still shows abbreviated all-time totals for the current session
-- changing the stats window during a running session resets the rolling counters, because the app does not keep full raw history forever
+This keeps the tool useful for intermittent problems without overreacting to a single timeout.
 
-## Failure Classification
+## Config
 
-Per cycle, `pingtop` first scores the current mix of target results:
-
-- most or all IP targets fail: likely general network issue
-- IP targets succeed while hostname DNS lookups mostly fail: likely DNS issue
-- DNS succeeds but the resolved IP does not answer ping: DNS okay, reachability bad
-- only one target fails while peers succeed: likely isolated target or path issue
-- anything else: mixed failure pattern
-
-For accuracy, higher-confidence diagnoses also need corroboration:
-
-- general network and DNS diagnoses prefer at least two similar corroborating targets
-- the diagnosis banner does not switch from a single noisy cycle alone; it waits for consecutive confirmation cycles
-
-This is intentionally heuristic. It is meant to make intermittent problems easier to categorize quickly, not to replace deeper packet-level troubleshooting.
-
-## Config Format
-
-`pingtop.json` is created automatically if missing and stores:
+`pingtop.json` is created automatically if missing and remains backward-compatible with the current schema:
 
 ```json
 {
@@ -137,17 +149,40 @@ This is intentionally heuristic. It is meant to make intermittent problems easie
 
 UI changes that affect settings are written back to `pingtop.json`.
 
-`visible_event_lines` limits how many recent events are shown in the live UI even if the in-memory history buffer is larger.
-`log_rotation_max_mb` can be set to `0` to disable rotation.
+## Tests
 
-## Notes and Tradeoffs
+Run the focused unit test suite with:
 
-- Windows is the primary target. The app uses `msvcrt` for key input there.
-- Linux and WSL use `select` plus `termios`/`tty`.
-- ANSI escape sequences drive the full-screen UI. On Windows, the app attempts to enable virtual terminal mode automatically.
-- Rolling stats are stored as time buckets instead of raw per-check history so long windows stay bounded in memory.
-- Diagnosis changes are intentionally conservative by default. The app favors multi-cycle confirmation over reacting to a single dropped probe.
-- Latency color thresholds are configurable with `latency_warning_ms` and `latency_critical_ms`.
-- `ping` latency parsing is best-effort. Success and failure are determined by command exit status first, and wall-clock timing is used as a fallback latency when parsing is not reliable.
-- The tool does not require admin/root privileges, but it still depends on a working system `ping` command.
-- The UI is intentionally simple ASCII text instead of `curses` so it works on stock Windows Python.
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests avoid live network or TTY requirements and focus on pure or mockable behavior:
+
+- target inference and config normalization
+- diagnosis confirmation behavior
+- rolling-window counters
+- around-failure logging and rotation
+- runtime path resolution
+- ping command construction
+- DNS/ping orchestration with mocks
+- headless `--once` flow with mocks
+
+## CI/CD
+
+GitHub Actions in `.github/workflows/ci.yml` does the following:
+
+- triggers on `push` and `pull_request`
+- runs compile checks and unit tests on `ubuntu-latest` and `windows-latest`
+- runs a dedicated build job after tests pass
+- builds `dist/pingtop.pyz` with `python scripts/build_pyz.py`
+- uploads the `.pyz` as a workflow artifact named like `pingtop-pyz-<sha>`
+
+The build job runs once, so you do not get duplicate identical artifacts from every test OS.
+
+## Limitations
+
+- The `.pyz` is still a Python application, so Python must already be installed on the machine.
+- `pingtop` still depends on the system `ping` command being available.
+- ICMP success/failure uses the system command exit status first. Latency parsing is best-effort and falls back to wall-clock timing when parsing is unreliable.
+- The UI is ANSI text, not `curses`, to keep Windows compatibility straightforward.
