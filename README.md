@@ -177,8 +177,16 @@ GitHub Actions in `.github/workflows/ci.yml` does the following:
 - runs a dedicated build job after tests pass
 - builds `dist/pingtop.pyz` with `python scripts/build_pyz.py`
 - uploads the `.pyz` as a workflow artifact named like `pingtop-pyz-<sha>`
+- on a pushed version tag like `v0.1.0`, creates or updates a GitHub Release for that tag and attaches `pingtop.pyz`
 
 The build job runs once, so you do not get duplicate identical artifacts from every test OS.
+
+Example release flow:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## Limitations
 
